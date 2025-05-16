@@ -66,6 +66,7 @@ Qキー：プログラム終了
         self.undo_stack: List[Tuple[List[Tuple[int, int]], List[int], str]] = []
         self.photo = None
         self.max_undo_steps = 20  # 取り消し可能な最大回数
+        self.scale = 1.0  # 画像のスケール係数
         
         # SAMモデルの初期化
         with warnings.catch_warnings():
@@ -180,9 +181,6 @@ Qキー：プログラム終了
             print(f"表示の更新に失敗しました: {e}")
             
     def left_click(self, event):
-        if self.is_dragging:  # ドラッグ中は点を追加しない
-            return
-            
         # キャンバス座標を画像座標に変換
         x = int(event.x / self.scale)
         y = int(event.y / self.scale)
@@ -198,9 +196,6 @@ Qキー：プログラム終了
         self.update_mask()
         
     def right_click(self, event):
-        if self.is_dragging:  # ドラッグ中は点を追加しない
-            return
-            
         # キャンバス座標を画像座標に変換
         x = int(event.x / self.scale)
         y = int(event.y / self.scale)
