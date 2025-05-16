@@ -66,7 +66,11 @@ Qキー：プログラム終了
         self.undo_stack: List[Tuple[List[Tuple[int, int]], List[int], str]] = []
         self.photo = None
         self.max_undo_steps = 20  # 取り消し可能な最大回数
+        self.original_image = None  # 元の画像を保持
+        self.original_image_rgb = None  # 元のRGB画像を保持
         self.scale = 1.0  # 画像のスケール係数
+        self.predictor_original = None  # 元の画像サイズ用の予測器
+        self.canvas_scale = 1.0  # キャンバス上の画像スケール
         
         # SAMモデルの初期化
         with warnings.catch_warnings():
@@ -95,12 +99,13 @@ Qキー：プログラム終了
             self.load_image()
             
     def load_image(self):
-        # 画像の読み込みを最適化
         try:
-            # PILを使用して画像を読み込み（OpenCVより高速）
-            pil_image = Image.open(self.image_path)
+            # 元の画像を読み込み
+            self.original_image = cv2.imread(self.image_path)
+            self.original_image_rgb = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
             
-            # 画像のリサイズ（アスペクト比を保持）
+            # 表示用にリサイズ
+            pil_image = Image.fromarray(self.original_image_rgb)
             max_size = 800
             width, height = pil_image.size
             if width > max_size or height > max_size:
@@ -108,16 +113,18 @@ Qキー：プログラム終了
                 new_width = int(width * ratio)
                 new_height = int(height * ratio)
                 pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                self.scale = ratio
+            else:
+                self.scale = 1.0
             
-            # PIL画像をNumPy配列に変換
+            # リサイズされた画像をNumPy配列に変換
             self.current_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
             self.current_image_rgb = np.array(pil_image)
             
-            # メモリの解放
-            del pil_image
-            
-            # SAMモデルに画像を設定
-            self.predictor.set_image(self.current_image_rgb)
+            # 両方のサイズでSAMモデルを初期化
+            self.predictor.set_image(self.current_image_rgb)  # 表示用
+            self.predictor_original = SamPredictor(self.model)
+            self.predictor_original.set_image(self.original_image_rgb)  # マスク生成用
             
             # 状態のリセット
             self.points = []
@@ -137,75 +144,73 @@ Qキー：プログラム終了
             return
             
         try:
+            # キャンバスのサイズを画像に合わせる
+            canvas_width = self.current_image.shape[1]
+            canvas_height = self.current_image.shape[0]
+            self.canvas.config(width=canvas_width, height=canvas_height)
+            
             # 表示用の画像を効率的に作成
             if self.mask is not None:
-                # マスクがある場合のみマスクを適用
+                # マスクを表示用サイズにリサイズ
+                display_mask = cv2.resize(self.mask, 
+                                        (canvas_width, canvas_height),
+                                        interpolation=cv2.INTER_NEAREST)
+                
                 display_image = self.current_image.copy()
                 mask_overlay = np.zeros_like(display_image)
-                mask_overlay[self.mask > 0] = [0, 255, 0]  # 緑色のオーバーレイ
+                mask_overlay[display_mask > 0] = [0, 255, 0]  # 緑色のオーバーレイ
                 cv2.addWeighted(display_image, 0.7, mask_overlay, 0.3, 0, display_image)
             else:
                 display_image = self.current_image.copy()
             
-            # 点の描画を最適化
+            # 点の描画
             if self.points:
-                points_array = np.array(self.points)
-                labels_array = np.array(self.point_labels)
-                
-                # 物体の点（緑）
-                obj_points = points_array[labels_array == 1]
-                if len(obj_points) > 0:
-                    for x, y in obj_points:
-                        cv2.circle(display_image, (x, y), 5, (0, 255, 0), -1)
-                
-                # 背景の点（赤）
-                bg_points = points_array[labels_array == 0]
-                if len(bg_points) > 0:
-                    for x, y in bg_points:
-                        cv2.circle(display_image, (x, y), 5, (0, 0, 255), -1)
+                for i, (x, y) in enumerate(self.points):
+                    # 元の画像座標を表示用座標に変換
+                    display_x = int(x * self.scale)
+                    display_y = int(y * self.scale)
+                    
+                    # 点の色を設定（物体：緑，背景：赤）
+                    color = (0, 255, 0) if self.point_labels[i] == 1 else (0, 0, 255)
+                    cv2.circle(display_image, (display_x, display_y), 5, color, -1)
             
-            # PILイメージに変換（メモリ効率を改善）
+            # PILイメージに変換
             image = Image.fromarray(cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB))
             self.photo = ImageTk.PhotoImage(image)
             
-            # キャンバスの更新を最適化
+            # キャンバスの更新
             self.canvas.delete("all")
-            self.canvas.config(width=image.width, height=image.height)
             self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
-            
-            # メモリの解放
-            del display_image
-            del image
             
         except Exception as e:
             print(f"表示の更新に失敗しました: {e}")
             
     def left_click(self, event):
-        # キャンバス座標を画像座標に変換
+        # キャンバス座標を元の画像座標に変換
         x = int(event.x / self.scale)
         y = int(event.y / self.scale)
         
-        # 現在の状態を保存（最大取り消し回数を制限）
+        # 現在の状態を保存
         if len(self.undo_stack) >= self.max_undo_steps:
-            self.undo_stack.pop(0)  # 最も古い操作を削除
+            self.undo_stack.pop(0)
         self.undo_stack.append((self.points.copy(), self.point_labels.copy(), "add_point"))
         
-        # 新しい点を追加
+        # 新しい点を追加（元の画像座標）
         self.points.append((x, y))
         self.point_labels.append(1)
         self.update_mask()
         
     def right_click(self, event):
-        # キャンバス座標を画像座標に変換
+        # キャンバス座標を元の画像座標に変換
         x = int(event.x / self.scale)
         y = int(event.y / self.scale)
         
-        # 現在の状態を保存（最大取り消し回数を制限）
+        # 現在の状態を保存
         if len(self.undo_stack) >= self.max_undo_steps:
-            self.undo_stack.pop(0)  # 最も古い操作を削除
+            self.undo_stack.pop(0)
         self.undo_stack.append((self.points.copy(), self.point_labels.copy(), "add_point"))
         
-        # 新しい点を追加
+        # 新しい点を追加（元の画像座標）
         self.points.append((x, y))
         self.point_labels.append(0)
         self.update_mask()
@@ -217,8 +222,8 @@ Qキー：プログラム終了
             return
             
         try:
-            # マスクの予測を最適化
-            masks, _, _ = self.predictor.predict(
+            # 元の画像サイズでマスクを予測
+            masks, _, _ = self.predictor_original.predict(
                 point_coords=np.array(self.points),
                 point_labels=np.array(self.point_labels),
                 multimask_output=False
@@ -277,7 +282,10 @@ Qキー：プログラム終了
         
         if file_path:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            # 元の画像サイズのマスクを保存
             cv2.imwrite(file_path, self.mask)
+            print(f"マスクを保存しました: {file_path}")
+            print(f"マスクサイズ: {self.mask.shape}")
             
     def key_press(self, event):
         if event.char.lower() == 'q':
